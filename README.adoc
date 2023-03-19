@@ -1,0 +1,42 @@
+= Note Tools
+
+These are tools for my personal, unabashedly opinionated note-taking system.
+
+== Rationale
+
+Note-taking is a personal process.  Depending on your personality and field of
+endeavour you will probably have very distinct preferences.  I don't expect
+anyone to find these tools as helpful as I do.
+
+Creating this system has given me the opportunity to explore the idea of users
+assembling their own applications instead of just selecting from a small number
+of pre-packaged applications that are their own islands.  This is reflected in
+the system's architecture: notes are edited in Neovim, which also serves as the
+UI for searching notes; a Sqlite database holds the note index and does the
+heavy lifting of searching and sorting; indexing and other tasks are handled by
+the Babashka scripting language.
+
+So while you may dislike some aspects of this design, it should be fairly easy
+to tweak and reassemble to reflect your own preferences.
+
+I don't have the patience to manually curate my notes, and this is also
+reflected in the design.  The system does not track cross-references between
+notes, nor does it implement any tagging system.  I also don't use a folder
+structure to organize my notes (although that's not specifically prevented).
+Instead I rely on the ability to easily and quickly search notes.  We are also
+in the golden age of AI language models, so my hope is to extend the system with
+such a model so it can find related notes, a-la
+link:https://github.com/debanjum/khoj[Khoj].
+
+Other design choices are simply my preferences.  I spend much of my working day
+using Neovim, so it makes sense that I can quickly add, edit, and search notes
+directly in Neovim.  It also explains why I avoid web-based tools: typing in a
+browser text field significantly slows me down, and even context switching from
+Neovim to a browser to search and view notes is a major inconvenience.
+
+I feel that Asciidoc strikes the right balance between power and simplicity for
+most of my writing.  It's annoying that Markdown is underpowered, so instead of
+a single language it's a family of slightly incompatible languages.  That said,
+the system only depends on Asciidoc for light parsing to extract note titles, and
+it delegates rendering of Asciidoc to HTML.  It would be fairly easy to change
+these if you wanted to adapt the system to some Markdown dialect.

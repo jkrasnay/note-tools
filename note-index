@@ -1,0 +1,229 @@
+#!/usr/bin/env bb
+; vim: ft=clojure
+
+(ns note-index
+  (:require
+    [babashka.cli :as cli]
+    [babashka.fs :as fs]
+    [babashka.pods :as pods]
+    [cheshire.core :as json]
+    [clojure.string :as string]
+    [clojure.pprint :refer [pprint]])
+  (:import
+    [java.time ZoneId]
+    [java.time.format DateTimeFormatter]))
+
+
+(pods/load-pod 'org.babashka/go-sqlite3 "0.1.0")
+
+(require '[pod.babashka.go-sqlite3 :as sqlite])
+
+;;------------------------------------------------------------
+;; Utilities
+;;
+
+(defn db-file
+  [notes-dir]
+  (str (fs/file notes-dir "index.db")))
+
+
+;;------------------------------------------------------------
+;; Database
+;;
+
+
+(defn init-db-if-required
+  [notes-dir]
+  (let [db-file (db-file notes-dir)]
+    (when-not (fs/exists? db-file)
+      (println "Initializing database" db-file)
+      (doto db-file
+        (sqlite/execute! "create table note (id integer primary key, path, title, body, note_ts, modified_ts)")
+        (sqlite/execute! "create virtual table note_fts using fts4(title, body, content='note', tokenize='porter')")
+        (sqlite/execute! "create trigger note_ai after insert on note begin
+                         insert into note_fts(rowid, title, body) values (new.rowid, new.title, new.body);
+                         end")
+        (sqlite/execute! "create trigger note_ad after delete on note begin
+                         insert into note_fts(note_fts, rowid, title, body) values('delete', old.rowid, old.title, old.body);
+                         end")
+        (sqlite/execute! "create trigger note_au after update on note begin
+                         insert into note_fts(note_fts, rowid, title, body) values('delete', old.rowid, old.title, old.body);
+                         insert into note_fts(rowid, title, body) values (new.rowid, new.title, new.body);
+                         end")))))
+
+
+
+
+;;------------------------------------------------------------
+;; Indexing
+;;
+
+(def dtf (-> (DateTimeFormatter/ofPattern "yyyy-MM-dd HH:mm:ss")
+             (.withZone (ZoneId/of "Z"))))
+
+
+(defn instant->str
+  [instant]
+  (.format dtf instant))
+
+
+(defn path->note-ts
+  [path]
+  (let [file-name (-> path
+                      fs/file-name
+                      fs/strip-ext)]
+    (when-let [[_ & parts] (re-matches #"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})" file-name)]
+      (apply format "%s-%s-%s %s:%s:%s" parts))))
+
+#_(path->note-ts "2023/20230116093748.adoc")
+
+
+(defn note-paths
+  [notes-dir]
+  (->> (fs/glob notes-dir "**.adoc")
+       (map #(str (fs/relativize notes-dir %)))))
+
+
+(defn parse
+  [notes-dir path]
+  (let [f (fs/file notes-dir path)
+        body (slurp f)
+        note-ts (or (path->note-ts path)
+                    (-> f fs/creation-time .toInstant instant->str))]
+    {:path path
+     :title (->> (string/split-lines body)
+                 (some #(second (re-matches #"=\s*(.*)" %))))
+     :body body
+     :note-ts note-ts
+     :modified-ts (-> f fs/last-modified-time .toInstant instant->str)}))
+
+#_(-> (parse ".." "2023/20230116093748.adoc")
+      (dissoc :body))
+
+
+(defn index-notes
+  [notes-dir]
+  (init-db-if-required notes-dir)
+  (let [db-file (db-file notes-dir)]
+    (doseq [path (note-paths notes-dir)]
+      (let [existing (first (sqlite/query db-file ["select modified_ts from note where path=?" path]))
+            modified-ts (-> (fs/file notes-dir path)
+                            fs/last-modified-time
+                            .toInstant
+                            instant->str)]
+        (when (or (not existing)
+                  (pos? (compare modified-ts (:modified_ts existing))))
+          (println "Indexing" path)
+          (let [{:keys [path title body note-ts modified-ts]} (parse notes-dir path)]
+            (sqlite/execute! db-file ["insert into note (path, title, body, note_ts, modified_ts) values (?, ?, ?, ?, ?)"
+                                      path title body note-ts modified-ts])))))))
+
+
+;;------------------------------------------------------------
+;; Listing
+;;
+
+(defn list-notes
+  [notes-dir]
+  (-> (sqlite/query (db-file notes-dir) ["select path, title from note order by note_ts desc"])
+      (json/generate-stream *out*))
+  nil)
+
+
+;;------------------------------------------------------------
+;; Main
+;;
+
+(defn print-help
+  []
+  (-> "
+      | Note Indexer
+      |
+      | Indexes notes into a sqlite database and performs queries
+      | on the index.
+      |
+      | Usage:
+      |
+      | note-index -d <notes-dir> index
+      | note-index --dir <notes-dir> index
+      |
+      |    Index notes in `notes-dir`
+      |
+      | note-index --dir <notes-dir> list
+      |
+      |    Produces a listing of all notes in the index
+      |
+      | note-index --dir <notes-dir> search 'foo bar'
+      |
+      |    Performs a full-text search of notes
+      |
+      | note-index help
+      | note-index -h
+      | note-index --help
+      |
+      |    Prints this help message
+      "
+      (string/replace #"\n *\| ?" "\n")
+      println))
+
+
+(defn validate-dir
+  [notes-dir]
+  (cond
+
+    (nil? notes-dir)
+    (println "Specify notes dir with --dir")
+
+    (not (fs/exists? notes-dir))
+    (printf "Notes dir '%s' does not exist" notes-dir)
+
+    (not (fs/directory? notes-dir))
+    (printf "Notes dir '%s' is not a directory" notes-dir)
+
+    :else
+    true))
+
+
+(defn validate-db
+  [notes-dir]
+  (if-not (fs/exists? (db-file notes-dir))
+    (printf "Notes index '%s' does not exists, please run 'index' first" (db-file notes-dir))
+    true))
+
+
+(defn -main [& args]
+  (let [{:keys [args opts]} (cli/parse-args args {:alias {:d :dir
+                                                          :h :help}})
+        {:keys [dir help]} opts
+        dir (when dir (str (fs/expand-home dir)))
+        [cmd & args] args]
+
+    (cond
+
+      (or help (nil? cmd) (= "help" cmd))
+      (print-help)
+
+      (= "index" cmd)
+      (and (validate-dir dir)
+           (index-notes dir))
+
+      (= "list" cmd)
+      (and (validate-dir dir)
+           (validate-db dir)
+           (list-notes dir))
+
+      :else
+      (println "Unrecognized command:" cmd))))
+
+#_(-main)
+#_(-main "-h")
+#_(-main "help")
+#_(-main "index")
+#_(-main "--dir" "foo" "index")
+#_(-main "--dir" "README.adoc" "index")
+#_(-main "--dir" "~/Dropbox/Notes" "index")
+#_(-main "--dir" "~/Dropbox/Notes" "list")
+#_(fs/expand-home "~/foo")
+
+(when (= *file* (System/getProperty "babashka.file"))
+  (apply -main *command-line-args*))
