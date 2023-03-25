@@ -8,19 +8,29 @@
     [babashka.pods :as pods]
     [cheshire.core :as json]
     [clojure.string :as string]
-    [clojure.pprint :refer [pprint]])
+    clojure.data)
   (:import
     [java.time ZoneId]
     [java.time.format DateTimeFormatter]))
 
 
 (pods/load-pod 'org.babashka/go-sqlite3 "0.1.0")
+(pods/load-pod 'org.babashka/fswatcher "0.0.3")
 
-(require '[pod.babashka.go-sqlite3 :as sqlite])
+(require
+  '[pod.babashka.go-sqlite3 :as sqlite]
+  '[pod.babashka.fswatcher :as fw])
+
 
 ;;------------------------------------------------------------
 ;; Utilities
 ;;
+
+(def notes-glob "**.adoc")
+(defn note-path?
+  [path]
+  (and path (string/ends-with? path ".adoc")))
+
 
 (defn db-file
   [notes-dir]
@@ -89,7 +99,7 @@
 
 (defn note-paths
   [notes-dir]
-  (->> (fs/glob notes-dir "**.adoc")
+  (->> (fs/glob notes-dir notes-glob)
        (map #(str (fs/relativize notes-dir %)))))
 
 
@@ -110,22 +120,64 @@
       (dissoc :body))
 
 
+(defn index-note
+  [notes-dir path]
+  (println "Indexing" path)
+  (let [{:keys [path title body note-ts modified-ts]} (parse notes-dir path)]
+    (sqlite/execute! (db-file notes-dir) ["delete from note where path=?" path])
+    (sqlite/execute! (db-file notes-dir) ["insert into note (path, title, body, note_ts, modified_ts) values (?, ?, ?, ?, ?)"
+                                          path title body note-ts modified-ts])))
+
+
+(defn remove-note
+  [notes-dir path]
+  (println "Removing" path)
+  (sqlite/execute! (db-file notes-dir) ["delete from note where path=?" path]))
+
+
 (defn index-notes
   [notes-dir]
   (init-db-if-required notes-dir)
-  (let [db-file (db-file notes-dir)]
-    (doseq [path (note-paths notes-dir)]
-      (let [existing (first (sqlite/query db-file ["select modified_ts from note where path=?" path]))
-            modified-ts (-> (fs/file notes-dir path)
+  (let [db-file (db-file notes-dir)
+        db-recs (->> (sqlite/query db-file ["select path, modified_ts from note"])
+                     (map (juxt :path :modified_ts))
+                     (into {}))
+        db-paths (set (keys db-recs))
+        file-paths (set (note-paths notes-dir))
+        [old-paths
+         new-paths
+         existing-paths] (clojure.data/diff db-paths file-paths)]
+    (doseq [path old-paths]
+      (remove-note notes-dir path))
+    (doseq [path new-paths]
+      (index-note notes-dir path))
+    (doseq [path existing-paths]
+      (let [db-mod-ts (get db-recs path)
+            file-mod-ts (-> (fs/file notes-dir path)
                             fs/last-modified-time
                             .toInstant
                             instant->str)]
-        (when (or (not existing)
-                  (pos? (compare modified-ts (:modified_ts existing))))
-          (println "Indexing" path)
-          (let [{:keys [path title body note-ts modified-ts]} (parse notes-dir path)]
-            (sqlite/execute! db-file ["insert into note (path, title, body, note_ts, modified_ts) values (?, ?, ?, ?, ?)"
-                                      path title body note-ts modified-ts])))))))
+        (when (pos? (compare file-mod-ts db-mod-ts))
+          (index-note notes-dir path))))))
+
+
+;;------------------------------------------------------------
+;; Watcher
+;;
+
+
+(defn watch-notes-dir
+  [notes-dir]
+  (println "Watching:" notes-dir)
+  (fw/watch notes-dir
+            (fn [{:keys [path]}]
+              (when (note-path? path)
+                (let [rel-path (str (fs/relativize notes-dir path))]
+                  (if (fs/exists? path)
+                    (index-note notes-dir rel-path)
+                    (remove-note notes-dir rel-path)))))
+            {:recursive true})
+  (deref (promise))) ; Block until killed
 
 
 ;;------------------------------------------------------------
@@ -157,6 +209,11 @@
       | note-index --dir <notes-dir> index
       |
       |    Index notes in `notes-dir`
+      |
+      | note-index --dir <notes-dir> watch
+      |
+      |    Watch the notes dir, re-indexing whenever a file changes,
+      |    until explicitly killed.
       |
       | note-index --dir <notes-dir> list
       |
@@ -215,6 +272,10 @@
       (= "index" cmd)
       (and (validate-dir dir)
            (index-notes dir))
+
+      (= "watch" cmd)
+      (and (validate-dir dir)
+           (watch-notes-dir dir))
 
       (= "list" cmd)
       (and (validate-dir dir)
