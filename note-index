@@ -32,24 +32,33 @@
 ;;
 
 
+
 (defn init-db-if-required
   [notes-dir]
   (let [db-file (db-file notes-dir)]
     (when-not (fs/exists? db-file)
       (println "Initializing database" db-file)
       (doto db-file
+
         (sqlite/execute! "create table note (id integer primary key, path, title, body, note_ts, modified_ts)")
+
         (sqlite/execute! "create virtual table note_fts using fts4(title, body, content='note', tokenize='porter')")
-        (sqlite/execute! "create trigger note_ai after insert on note begin
-                         insert into note_fts(rowid, title, body) values (new.rowid, new.title, new.body);
-                         end")
-        (sqlite/execute! "create trigger note_ad after delete on note begin
-                         insert into note_fts(note_fts, rowid, title, body) values('delete', old.rowid, old.title, old.body);
-                         end")
+
+        (sqlite/execute! "create trigger note_bu before update on note begin
+                         delete from note_fts where docid=old.rowid;
+                         end;")
+
+        (sqlite/execute! "create trigger note_bd before delete on note begin
+                         delete from note_fts where docid=old.rowid;
+                         end;")
+
         (sqlite/execute! "create trigger note_au after update on note begin
-                         insert into note_fts(note_fts, rowid, title, body) values('delete', old.rowid, old.title, old.body);
-                         insert into note_fts(rowid, title, body) values (new.rowid, new.title, new.body);
-                         end")))))
+                         insert into note_fts(docid, title, body) values (new.rowid, new.title, new.body);
+                         end;")
+
+        (sqlite/execute! "create trigger note_ai after insert on note begin
+                         insert into note_fts(docid, title, body) values (new.rowid, new.title, new.body);
+                         end;")))))
 
 
 
